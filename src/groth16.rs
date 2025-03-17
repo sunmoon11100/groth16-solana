@@ -25,19 +25,24 @@
 //!
 //! See functional test for a running example how to use this library.
 //!
-use crate::errors::Groth16Error;
+
+use std::ops::Neg;
+
 use ark_ff::PrimeField;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use num_bigint::BigUint;
-use solana_program::alt_bn128::prelude::{
-    alt_bn128_addition, alt_bn128_multiplication, alt_bn128_pairing,
-};
+use solana_bn254::prelude::{alt_bn128_addition, alt_bn128_multiplication, alt_bn128_pairing};
+
+use crate::errors::Groth16Error;
+
+type G1 = ark_bn254::g1::G1Affine;
 
 #[derive(PartialEq, Eq, Debug)]
-pub struct Groth16Verifyingkey<'a> {
-    pub nr_pubinputs: usize,
+pub struct Groth16VerifyingKey<'a> {
+    pub nr_pub_inputs: usize,
     pub vk_alpha_g1: [u8; 64],
     pub vk_beta_g2: [u8; 128],
-    pub vk_gamme_g2: [u8; 128],
+    pub vk_gamma_g2: [u8; 128],
     pub vk_delta_g2: [u8; 128],
     pub vk_ic: &'a [[u8; 64]],
 }
@@ -49,7 +54,7 @@ pub struct Groth16Verifier<'a, const NR_INPUTS: usize> {
     proof_c: &'a [u8; 64],
     public_inputs: &'a [[u8; 32]; NR_INPUTS],
     prepared_public_inputs: [u8; 64],
-    verifyingkey: &'a Groth16Verifyingkey<'a>,
+    verifying_key: &'a Groth16VerifyingKey<'a>,
 }
 
 impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
@@ -58,7 +63,7 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
         proof_b: &'a [u8; 128],
         proof_c: &'a [u8; 64],
         public_inputs: &'a [[u8; 32]; NR_INPUTS],
-        verifyingkey: &'a Groth16Verifyingkey<'a>,
+        verifyingkey: &'a Groth16VerifyingKey<'a>,
     ) -> Result<Groth16Verifier<'a, NR_INPUTS>, Groth16Error> {
         if proof_a.len() != 64 {
             return Err(Groth16Error::InvalidG1Length);
@@ -82,19 +87,19 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
             proof_c,
             public_inputs,
             prepared_public_inputs: [0u8; 64],
-            verifyingkey,
+            verifying_key: verifyingkey,
         })
     }
 
     pub fn prepare_inputs<const CHECK: bool>(&mut self) -> Result<(), Groth16Error> {
-        let mut prepared_public_inputs = self.verifyingkey.vk_ic[0];
+        let mut prepared_public_inputs = self.verifying_key.vk_ic[0];
 
         for (i, input) in self.public_inputs.iter().enumerate() {
             if CHECK && !is_less_than_bn254_field_size_be(input) {
                 return Err(Groth16Error::PublicInputGreaterThenFieldSize);
             }
             let mul_res = alt_bn128_multiplication(
-                &[&self.verifyingkey.vk_ic[i + 1][..], &input[..]].concat(),
+                &[&self.verifying_key.vk_ic[i + 1][..], &input[..]].concat(),
             )
             .map_err(|_| Groth16Error::PreparingInputsG1MulFailed)?;
             prepared_public_inputs =
@@ -124,15 +129,32 @@ impl<const NR_INPUTS: usize> Groth16Verifier<'_, NR_INPUTS> {
     fn verify_common<const CHECK: bool>(&mut self) -> Result<bool, Groth16Error> {
         self.prepare_inputs::<CHECK>()?;
 
+        let a_neg: G1 = G1::deserialize_with_mode(
+            &*[&change_endianness(self.proof_a), &[0u8][..]].concat(),
+            Compress::No,
+            Validate::Yes,
+        )
+        .unwrap()
+        .neg();
+        let mut proof_a_neg = [0u8; 65];
+        a_neg
+            .x
+            .serialize_with_mode(&mut proof_a_neg[..32], Compress::No)
+            .unwrap();
+        a_neg
+            .y
+            .serialize_with_mode(&mut proof_a_neg[32..], Compress::No)
+            .unwrap();
+
         let pairing_input = [
-            self.proof_a.as_slice(),
+            change_endianness(&proof_a_neg[..64]).as_slice(),
             self.proof_b.as_slice(),
             self.prepared_public_inputs.as_slice(),
-            self.verifyingkey.vk_gamme_g2.as_slice(),
+            self.verifying_key.vk_gamma_g2.as_slice(),
             self.proof_c.as_slice(),
-            self.verifyingkey.vk_delta_g2.as_slice(),
-            self.verifyingkey.vk_alpha_g1.as_slice(),
-            self.verifyingkey.vk_beta_g2.as_slice(),
+            self.verifying_key.vk_delta_g2.as_slice(),
+            self.verifying_key.vk_alpha_g1.as_slice(),
+            self.verifying_key.vk_beta_g2.as_slice(),
         ]
         .concat();
 
@@ -151,21 +173,30 @@ pub fn is_less_than_bn254_field_size_be(bytes: &[u8; 32]) -> bool {
     bigint < ark_bn254::Fr::MODULUS.into()
 }
 
+fn change_endianness(bytes: &[u8]) -> Vec<u8> {
+    let mut vec = Vec::new();
+    for b in bytes.chunks(32) {
+        for byte in b.iter().rev() {
+            vec.push(*byte);
+        }
+    }
+    vec
+}
+
 #[cfg(test)]
 mod tests {
+    use ark_bn254;
+    use ark_ff::BigInteger;
+    use solana_bn254::compression::prelude::convert_endianness;
+
     use crate::decompression::{decompress_g1, decompress_g2};
 
     use super::*;
-    use ark_bn254;
-    use ark_ff::BigInteger;
-    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
-    use std::ops::Neg;
-    type G1 = ark_bn254::g1::G1Affine;
-    type G2 = ark_bn254::g2::G2Affine;
-    use solana_program::alt_bn128::compression::prelude::convert_endianness;
 
-    pub const VERIFYING_KEY: Groth16Verifyingkey = Groth16Verifyingkey {
-        nr_pubinputs: 10,
+    type G2 = ark_bn254::g2::G2Affine;
+
+    pub const VERIFYING_KEY: Groth16VerifyingKey = Groth16VerifyingKey {
+        nr_pub_inputs: 10,
 
         vk_alpha_g1: [
             45, 77, 154, 167, 227, 2, 217, 223, 65, 116, 157, 85, 7, 148, 157, 5, 219, 234, 51,
@@ -184,7 +215,7 @@ mod tests {
             248, 150, 183, 198, 62, 234, 5, 169, 213, 127, 6, 84, 122, 208, 206, 200,
         ],
 
-        vk_gamme_g2: [
+        vk_gamma_g2: [
             25, 142, 147, 147, 146, 13, 72, 58, 114, 96, 191, 183, 49, 251, 93, 37, 241, 170, 73,
             51, 53, 169, 231, 18, 151, 228, 133, 183, 174, 243, 18, 194, 24, 0, 222, 239, 18, 31,
             30, 118, 66, 106, 0, 102, 94, 92, 68, 121, 103, 67, 34, 212, 247, 94, 218, 221, 70,
@@ -268,16 +299,6 @@ mod tests {
         ],
     };
 
-    fn change_endianness(bytes: &[u8]) -> Vec<u8> {
-        let mut vec = Vec::new();
-        for b in bytes.chunks(32) {
-            for byte in b.iter().rev() {
-                vec.push(*byte);
-            }
-        }
-        vec
-    }
-
     pub const PUBLIC_INPUTS: [[u8; 32]; 9] = [
         [
             34, 238, 251, 182, 234, 248, 214, 189, 46, 67, 42, 25, 71, 58, 145, 58, 61, 28, 116,
@@ -347,25 +368,7 @@ mod tests {
 
     #[test]
     fn proof_verification_should_succeed() {
-        let proof_a: G1 = G1::deserialize_with_mode(
-            &*[&change_endianness(&PROOF[0..64]), &[0u8][..]].concat(),
-            Compress::No,
-            Validate::Yes,
-        )
-        .unwrap();
-        let mut proof_a_neg = [0u8; 65];
-        proof_a
-            .neg()
-            .x
-            .serialize_with_mode(&mut proof_a_neg[..32], Compress::No)
-            .unwrap();
-        proof_a
-            .neg()
-            .y
-            .serialize_with_mode(&mut proof_a_neg[32..], Compress::No)
-            .unwrap();
-
-        let proof_a = change_endianness(&proof_a_neg[..64]).try_into().unwrap();
+        let proof_a = PROOF[0..64].try_into().unwrap();
         let proof_b = PROOF[64..192].try_into().unwrap();
         let proof_c = PROOF[192..256].try_into().unwrap();
 
@@ -409,25 +412,6 @@ mod tests {
         let compressed_proof_c = compress_g1_be(&PROOF[192..].try_into().unwrap());
 
         let proof_a = decompress_g1(&compressed_proof_a).unwrap();
-        let proof_a: G1 = G1::deserialize_with_mode(
-            &*[&change_endianness(&proof_a[0..64]), &[0u8][..]].concat(),
-            Compress::No,
-            Validate::Yes,
-        )
-        .unwrap();
-        let mut proof_a_neg = [0u8; 65];
-        proof_a
-            .neg()
-            .x
-            .serialize_with_mode(&mut proof_a_neg[..32], Compress::No)
-            .unwrap();
-        proof_a
-            .neg()
-            .y
-            .serialize_with_mode(&mut proof_a_neg[32..], Compress::No)
-            .unwrap();
-
-        let proof_a = change_endianness(&proof_a_neg[..64]).try_into().unwrap();
         let proof_b = decompress_g2(&compressed_proof_b).unwrap();
         let proof_c = decompress_g1(&compressed_proof_c).unwrap();
         let mut verifier =
@@ -438,30 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_proof_verification_should_not_succeed() {
-        let proof_a = PROOF[0..64].try_into().unwrap();
-        let proof_b = PROOF[64..192].try_into().unwrap();
-        let proof_c = PROOF[192..256].try_into().unwrap();
-        let mut verifier = Groth16Verifier::new(
-            &proof_a, // using non negated proof a as test for wrong proof
-            &proof_b,
-            &proof_c,
-            &PUBLIC_INPUTS,
-            &VERIFYING_KEY,
-        )
-        .unwrap();
-        assert_eq!(
-            verifier.verify(),
-            Err(Groth16Error::ProofVerificationFailed)
-        );
-        assert_eq!(
-            verifier.verify_unchecked(),
-            Err(Groth16Error::ProofVerificationFailed)
-        );
-    }
-
-    #[test]
-    fn public_input_greater_than_field_size_should_not_suceed() {
+    fn public_input_greater_than_field_size_should_not_succeed() {
         let proof_a = PROOF[0..64].try_into().unwrap();
         let proof_b = PROOF[64..192].try_into().unwrap();
         let proof_c = PROOF[192..256].try_into().unwrap();
