@@ -1,14 +1,18 @@
 var ffjavascript = require('ffjavascript');
 const {unstringifyBigInts, leInt2Buff} = ffjavascript.utils;
 var fs = require("fs")
+const process = require('process');
 
 async function main() {
-  const inputPath = "./circuits/build/verification_key.json";
+  let inputPath = process.argv[2];
   if (!inputPath) {
     throw new Error("inputPath not specified");
   }
 
-  let outputPath = "./programs/verifier/src/"
+  let outputPath = ""
+  if (process.argv[3]) {
+    outputPath += process.argv[3] +"/";
+  }
 
   console.log = () => {};
 
@@ -74,7 +78,7 @@ async function main() {
 
 
     let resFile = fs.openSync(outputPath + "verifying_key.rs", "w")
-    let s = `use groth16_solana::groth16::Groth16VerifyingKey;\n\npub const VERIFYINGKEY: Groth16VerifyingKey =  Groth16VerifyingKey {\n\tnr_pub_inputs: ${myData.IC.length},\n\n`
+    let s = `use groth16_solana::groth16::Groth16VerifyingKey;\n\npub const VERIFYING_KEY: Groth16VerifyingKey =  Groth16VerifyingKey {\n\tnr_pub_inputs: ${myData.IC.length},\n\n`
     s += "\tvk_alpha_g1: [\n"
     for (let j = 0; j < myData.vk_alpha_1.length -1 ; j++) {
       console.log(typeof(myData.vk_alpha_1[j]))
